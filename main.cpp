@@ -11,20 +11,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <vector>
+#include <algorithm>
 
 // ── Constants ────────────────────────────────────────────────
 static const int   CELL  = 20;
 static const int   COLS  = 28;
 static const int   ROWS  = 31;
 static const int   WIN_W = COLS * CELL;
-static const int   WIN_H = ROWS * CELL + 60;
+static const int   WIN_H = ROWS * CELL + 50;
 static const float PI    = 3.14159265f;
 
 // ── Direction enums & deltas ─────────────────────────────────
 enum Dir { D_NONE=-1, D_R=0, D_U=1, D_L=2, D_D=3 };
 static int DC[4] = {1,0,-1,0};
 static int DR[4] = {0,-1,0,1};
+
+static Dir opposite(Dir d){
+    switch(d){case D_R:return D_L;case D_L:return D_R;
+              case D_U:return D_D;case D_D:return D_U;default:return D_NONE;}
+}
 
 // ── Maze template ────────────────────────────────────────────
 static const int MT[ROWS][COLS] = {
@@ -60,41 +67,159 @@ static const int MT[ROWS][COLS] = {
 {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1},
 {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1}
 };
+static int maze[ROWS][COLS];
 
-// ── Perk struct ──────────────────────────────────────────────
-struct Perk { int c,r,type; bool on; };
+// ── Structs ──────────────────────────────────────────────────
+struct Pt { float x,y,vx,vy,life,r,g,b; };
+struct Ghost {
+    int col,row,tc,tr;
+    float progress,speed,x,y,r,g,b;
+    int id;
+    bool frightened; float frighTimer;
+    bool eaten,inHouse; float houseWait;
+    Dir lastDir;
+    std::vector<Pt> fire; float fireT;
+};
 
-// ── Game state ───────────────────────────────────────────────
-static int   maze[ROWS][COLS];
-static int   dotsLeft = 0;
-static int   score    = 0;
-static bool  spdBoost = false;  static float spdT = 0;
-static bool  frozen   = false;  static float frzT = 0;
-static std::vector<Perk> perks;
-
-static float pacX, pacY;
-static Dir   pacDir = D_R, pacWant = D_R;
-static float pacSpd = 2.5f;
-static float mouthA = 0, mouthD = 1;
-
-// ── Helpers ──────────────────────────────────────────────────
-static bool isWall(int c, int r){
+// ── Maze helpers ─────────────────────────────────────────────
+static bool isWall(int c,int r){
     if(c<0||c>=COLS||r<0||r>=ROWS) return true;
-    return maze[r][c] == 1;
+    return maze[r][c]==1;
 }
-static bool pacOK(float nx, float ny){
-    float rad = 7.5f;
-    int cs[2] = {(int)((nx-rad)/CELL),(int)((nx+rad)/CELL)};
-    int rs[2] = {(int)((ny-rad)/CELL),(int)((ny+rad)/CELL)};
-    for(int i=0;i<2;i++) for(int j=0;j<2;j++)
-        if(isWall(cs[i],rs[j])) return false;
+static bool isDoor(int c,int r){
+    if(c<0||c>=COLS||r<0||r>=ROWS) return false;
+    return maze[r][c]==4;
+}
+static bool gOK(int c,int r,bool allowDoor=false){
+    if(c<0||c>=COLS||r<0||r>=ROWS) return false;
+    if(maze[r][c]==1) return false;
+    if(isDoor(c,r)&&!allowDoor) return false;
     return true;
 }
-static float wrapX(float x){
-    float W=COLS*CELL;
-    if(x<0) return x+W;
-    if(x>=W) return x-W;
-    return x;
+
+// ── Ghost AI state ────────────────────────────────────────────
+// Pac-Man is replaced by a dummy moving target for this demo
+static float dummyX = 13.5f*CELL;
+static float dummyY = 23.5f*CELL;
+static float dummyAngle = 0;
+static std::vector<Ghost> ghosts;
+
+// ── Pathfinding ───────────────────────────────────────────────
+static void pickNext(Ghost& g, float tx, float ty, bool allowDoor){
+    int gc=g.tc, gr=g.tr;
+    Dir noGo=opposite(g.lastDir);
+    int bestC=gc,bestR=gr; float bestD=1e18f; bool found=false;
+    for(int d=0;d<4;d++){
+        if((Dir)d==noGo) continue;
+        int nc=gc+DC[d],nr=gr+DR[d];
+        if(!gOK(nc,nr,allowDoor)) continue;
+        float dx=(nc+0.5f)*CELL-tx, dy=(nr+0.5f)*CELL-ty;
+        float dd=dx*dx+dy*dy;
+        if(!found||dd<bestD){bestD=dd;bestC=nc;bestR=nr;found=true;}
+    }
+    if(!found){
+        Dir rev=opposite(g.lastDir);
+        if(rev!=D_NONE){int nc=gc+DC[(int)rev],nr=gr+DR[(int)rev];if(gOK(nc,nr,allowDoor)){bestC=nc;bestR=nr;found=true;}}
+    }
+    if(!found){for(int d=0;d<4;d++){int nc=gc+DC[d],nr=gr+DR[d];if(gOK(nc,nr,allowDoor)){bestC=nc;bestR=nr;found=true;break;}}}
+    int ddc=bestC-gc,ddr=bestR-gr;
+    g.lastDir=D_NONE;
+    for(int d=0;d<4;d++) if(DC[d]==ddc&&DR[d]==ddr){g.lastDir=(Dir)d;break;}
+    g.col=gc;g.row=gr;g.tc=bestC;g.tr=bestR;g.progress=0;
+}
+
+static void pickNextRandom(Ghost& g, bool allowDoor){
+    int gc=g.tc,gr=g.tr;
+    Dir noGo=opposite(g.lastDir);
+    int valid[4]; int nv=0;
+    for(int d=0;d<4;d++){
+        if((Dir)d==noGo) continue;
+        int nc=gc+DC[d],nr=gr+DR[d];
+        if(gOK(nc,nr,allowDoor)) valid[nv++]=d;
+    }
+    int chosen=-1;
+    if(nv>0) chosen=valid[rand()%nv];
+    else for(int d=0;d<4;d++){int nc=gc+DC[d],nr=gr+DR[d];if(gOK(nc,nr,allowDoor)){chosen=d;break;}}
+    if(chosen<0){g.col=gc;g.row=gr;g.tc=gc;g.tr=gr;g.progress=0;return;}
+    g.lastDir=(Dir)chosen;
+    g.col=gc;g.row=gr;g.tc=gc+DC[chosen];g.tr=gr+DR[chosen];g.progress=0;
+}
+
+// ── Ghost target ─────────────────────────────────────────────
+static void ghostTarget(const Ghost& g, float& tx, float& ty){
+    // id 0: direct chase
+    if(g.id==0){tx=dummyX;ty=dummyY;return;}
+    // id 1: 4 tiles ahead
+    if(g.id==1){tx=dummyX+DC[D_R]*4*CELL;ty=dummyY+DR[D_R]*4*CELL;return;}
+    // id 2: flanking
+    if(g.id==2 && !ghosts.empty()){
+        float p2x=dummyX+DC[D_R]*2*CELL, p2y=dummyY+DR[D_R]*2*CELL;
+        tx=2*p2x-ghosts[0].x; ty=2*p2y-ghosts[0].y; return;
+    }
+    // id 3: scatter when close
+    if(g.id==3){
+        float d2=(g.col*CELL+CELL/2-dummyX)*(g.col*CELL+CELL/2-dummyX)+
+                 (g.row*CELL+CELL/2-dummyY)*(g.row*CELL+CELL/2-dummyY);
+        if(d2>(8*CELL)*(8*CELL)){tx=dummyX;ty=dummyY;}
+        else{tx=1*CELL;ty=29*CELL;}
+        return;
+    }
+    tx=dummyX;ty=dummyY;
+}
+
+// ── Fire particles ────────────────────────────────────────────
+static void updateFire(Ghost& g, float dt){
+    if(g.id!=0||g.inHouse||g.eaten||g.frightened) return;
+    g.fireT-=dt;
+    if(g.fireT<=0){
+        g.fireT=1.5f+(float)(rand()%3);
+        float px=((1-g.progress)*g.col+g.progress*g.tc+0.5f)*CELL;
+        float py=((1-g.progress)*g.row+g.progress*g.tr+0.5f)*CELL;
+        for(int i=0;i<10;i++){
+            Pt p;p.x=px;p.y=py;
+            float a=rand()%360*PI/180; float sp=12+(rand()%20);
+            p.vx=cosf(a)*sp;p.vy=sinf(a)*sp;p.life=1;
+            p.r=1;p.g=0.1f+(rand()%6)*0.1f;p.b=0;
+            g.fire.push_back(p);
+        }
+    }
+    for(auto& p:g.fire){p.x+=p.vx*dt;p.y+=p.vy*dt;p.life-=dt*1.3f;}
+    g.fire.erase(std::remove_if(g.fire.begin(),g.fire.end(),[](const Pt& p){return p.life<=0;}),g.fire.end());
+}
+
+// ── Step ghost ────────────────────────────────────────────────
+static void stepGhost(Ghost& g, float dt){
+    float tileTime=1.0f/g.speed;
+    g.progress+=dt/tileTime;
+    if(g.progress>=1.0f){
+        g.progress=1.0f;
+        g.x=(g.tc+0.5f)*CELL;
+        g.y=(g.tr+0.5f)*CELL;
+        bool allowDoor=g.eaten;
+        if(g.frightened) pickNextRandom(g,allowDoor);
+        else{float tx,ty;ghostTarget(g,tx,ty);pickNext(g,tx,ty,allowDoor);}
+    }
+}
+
+// ── Ghost factory ─────────────────────────────────────────────
+static Ghost makeGhost(int id){
+    Ghost g;
+    g.id=id;g.progress=0;g.frightened=false;g.frighTimer=0;
+    g.eaten=false;g.inHouse=true;g.fireT=2.0f;g.fire.clear();g.lastDir=D_L;
+    g.speed=3.0f;
+    static const int SC[4]={13,13,11,15};
+    static const int SR[4]={14,13,13,13};
+    g.col=SC[id];g.row=SR[id];g.tc=SC[id];g.tr=SR[id];
+    g.houseWait=(float)id*3.0f;
+    switch(id){
+        case 0:g.r=1;g.g=0.1f;g.b=0.1f;break;
+        case 1:g.r=1;g.g=0.6f;g.b=0.8f;break;
+        case 2:g.r=0;g.g=0.9f;g.b=0.9f;break;
+        case 3:g.r=1;g.g=0.6f;g.b=0.1f;break;
+    }
+    g.x=(g.col+0.5f)*CELL;
+    g.y=(g.row+0.5f)*CELL;
+    return g;
 }
 
 // ── Draw helpers ─────────────────────────────────────────────
@@ -113,105 +238,91 @@ static void fRect(float x,float y,float w,float h){
     glVertex2f(x,y);glVertex2f(x+w,y);glVertex2f(x+w,y+h);glVertex2f(x,y+h);
     glEnd();
 }
-static void dStr(float x,float y,const char* s,void* f=GLUT_BITMAP_HELVETICA_18){
+static void dStr(float x,float y,const char* s,void* f=GLUT_BITMAP_HELVETICA_12){
     glRasterPos2f(x,y); for(;*s;s++) glutBitmapCharacter(f,*s);
 }
 
-// ── Init ─────────────────────────────────────────────────────
-static void initMaze(){
-    dotsLeft=0;
+// ── Draw maze (walls only, no dots for clarity) ───────────────
+static void drawMazeBg(){
     for(int r=0;r<ROWS;r++) for(int c=0;c<COLS;c++){
-        maze[r][c]=MT[r][c];
-        if(maze[r][c]==0||maze[r][c]==3) dotsLeft++;
-    }
-    perks.clear();
-    perks.push_back({6,11,0,true});
-    perks.push_back({21,11,1,true});
-    pacX=13.5f*CELL; pacY=23.5f*CELL;
-    pacDir=D_R; pacWant=D_R;
-    score=0; spdBoost=false; frozen=false;
-}
-
-// ── Draw maze ────────────────────────────────────────────────
-static void drawMaze(){
-    float t=(float)glutGet(GLUT_ELAPSED_TIME)*0.001f;
-    for(int r=0;r<ROWS;r++) for(int c=0;c<COLS;c++){
-        float px=c*CELL, py=r*CELL;
-        int v=maze[r][c];
-        if(v==1){
-            glColor3f(0.05f,0.05f,0.80f); fRect(px,py,CELL,CELL);
-            glColor3f(0.15f,0.15f,1); glLineWidth(1.2f);
+        float px=c*CELL,py=r*CELL;
+        if(maze[r][c]==1){
+            glColor3f(0.05f,0.05f,0.70f);fRect(px,py,CELL,CELL);
+            glColor3f(0.1f,0.1f,0.9f);glLineWidth(1.0f);
             glBegin(GL_LINE_LOOP);
-            glVertex2f(px+1,py+1); glVertex2f(px+CELL-1,py+1);
-            glVertex2f(px+CELL-1,py+CELL-1); glVertex2f(px+1,py+CELL-1);
+            glVertex2f(px+1,py+1);glVertex2f(px+CELL-1,py+1);
+            glVertex2f(px+CELL-1,py+CELL-1);glVertex2f(px+1,py+CELL-1);
             glEnd();
-        } else if(v==0){
-            glColor3f(0.9f,0.9f,0.6f); fCirc(px+CELL/2,py+CELL/2,2.0f);
-        } else if(v==3){
-            float s=0.6f+0.4f*sinf(t*5);
-            glColor3f(1,1,s); fCirc(px+CELL/2,py+CELL/2,5.5f);
-        } else if(v==4){
-            glColor3f(0.8f,0.4f,0.8f); fRect(px,py+CELL/2-1.5f,CELL,3);
-        }
-    }
-    // Perks
-    for(auto& p:perks){
-        if(!p.on) continue;
-        float px=p.c*CELL+CELL/2, py=p.r*CELL+CELL/2;
-        if(p.type==0){
-            glColor3f(1,0.9f,0);
-            glBegin(GL_TRIANGLE_FAN); glVertex2f(px,py);
-            for(int i=0;i<=10;i++){float a=PI/2+i*2*PI/10;float rr=(i%2==0)?7.0f:3.0f;glVertex2f(px+rr*cosf(a),py+rr*sinf(a));}
-            glEnd();
-        } else {
-            glColor3f(0.4f,0.8f,1); glLineWidth(2);
-            glBegin(GL_LINES);
-            for(int i=0;i<4;i++){float a=i*PI/4;glVertex2f(px-6*cosf(a),py-6*sinf(a));glVertex2f(px+6*cosf(a),py+6*sinf(a));}
-            glEnd(); glLineWidth(1);
+        } else if(maze[r][c]==4){
+            glColor3f(0.8f,0.4f,0.8f);fRect(px,py+CELL/2-1.5f,CELL,3);
         }
     }
 }
 
-// ── Draw Pac-Man ─────────────────────────────────────────────
-static void drawPac(){
-    float base=0;
-    if(pacDir==D_U) base=PI/2;
-    else if(pacDir==D_L) base=PI;
-    else if(pacDir==D_D) base=-PI/2;
-    float open=(mouthA*PI/180)*0.5f;
-    glColor3f(1,1,0); fArc(pacX,pacY,9,base+open,base+2*PI-open);
-    glColor3f(0,0,0); fCirc(pacX+cosf(base+PI/4)*5,pacY+sinf(base+PI/4)*5,1.5f,8);
-    if(spdBoost){
-        glColor3f(1,0.9f,0); glLineWidth(2);
-        glBegin(GL_LINE_LOOP);
-        for(int i=0;i<16;i++){float a=2*PI*i/16;glVertex2f(pacX+13*cosf(a),pacY+13*sinf(a));}
-        glEnd(); glLineWidth(1);
+// ── Draw a ghost ─────────────────────────────────────────────
+static void drawGhost(const Ghost& g){
+    float px=((1-g.progress)*g.col+g.progress*g.tc+0.5f)*CELL;
+    float py=((1-g.progress)*g.row+g.progress*g.tr+0.5f)*CELL;
+    float rr=9.0f;
+
+    if(g.eaten){
+        glColor3f(1,1,1);fCirc(px-3,py+1,3);fCirc(px+3,py+1,3);
+        glColor3f(0,0,1);fCirc(px-3,py+1,1.5f,8);fCirc(px+3,py+1,1.5f,8);
+        return;
+    }
+    float cr=g.r,cg=g.g,cb=g.b;
+    if(g.frightened){
+        if(g.frighTimer<3&&(int)(g.frighTimer*4)%2)cr=cg=cb=0.9f;
+        else{cr=0;cg=0;cb=0.8f;}
+    }
+    glColor3f(cr,cg,cb);
+    fArc(px,py,rr,0,PI,20);
+    fRect(px-rr,py,rr*2,rr);
+    glBegin(GL_TRIANGLES);
+    float sw=rr*2/3;
+    for(int i=0;i<3;i++){float bx=px-rr+i*sw;glVertex2f(bx,py+rr);glVertex2f(bx+sw,py+rr);glVertex2f(bx+sw*0.5f,py+rr-5);}
+    glEnd();
+    if(!g.frightened){
+        float ex=0,ey=0;
+        if(g.lastDir==D_R)ex=1.5f; else if(g.lastDir==D_L)ex=-1.5f;
+        else if(g.lastDir==D_U)ey=-1.5f; else if(g.lastDir==D_D)ey=1.5f;
+        glColor3f(1,1,1);fCirc(px-3,py,3);fCirc(px+3,py,3);
+        glColor3f(0,0,0.9f);fCirc(px-3+ex,py+ey,1.5f,8);fCirc(px+3+ex,py+ey,1.5f,8);
+    }
+    if(!g.fire.empty()){
+        glEnable(GL_BLEND);glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+        for(auto& p:g.fire){glColor4f(p.r,p.g,p.b,p.life);fCirc(p.x,p.y,3*p.life,6);}
+        glDisable(GL_BLEND);
     }
 }
 
-// ── Draw HUD ─────────────────────────────────────────────────
+// ── HUD ──────────────────────────────────────────────────────
 static void drawHUD(){
     float hy=ROWS*CELL;
-    glColor3f(0,0,0); fRect(0,hy,WIN_W,60);
-    char buf[64];
+    glColor3f(0,0,0);fRect(0,hy,WIN_W,50);
     glColor3f(1,1,1);
-    sprintf(buf,"SCORE %d",score); dStr(10,hy+22,buf);
-    sprintf(buf,"DOTS LEFT %d",dotsLeft); dStr(195,hy+22,buf);
-    if(spdBoost){glColor3f(1,1,0); dStr(10,hy+48,"SPD BOOST",GLUT_BITMAP_HELVETICA_12);}
-    if(frozen)  {glColor3f(0.4f,0.8f,1); dStr(120,hy+48,"FROZEN",GLUT_BITMAP_HELVETICA_12);}
-    glColor3f(0.5f,0.5f,0.5f);
-    dStr(320,hy+48,"Arrow keys to move | R = reset",GLUT_BITMAP_HELVETICA_12);
+    dStr(10,hy+18,"GHOST AI DEMO  |  Click = frighten  |  SPACE = eat all  |  R = reset");
+    // Ghost name labels
+    static const char* names[]={"Blinky (direct chase)","Pinky (4-ahead)","Inky (flanking)","Clyde (scatter)"};
+    static const float cr[]={1,1,0,1}, cg[]={0.1f,0.6f,0.9f,0.6f}, cb[]={0.1f,0.8f,0.9f,0.1f};
+    for(int i=0;i<4&&i<(int)ghosts.size();i++){
+        glColor3f(cr[i],cg[i],cb[i]);
+        char buf[64]; sprintf(buf,"%s",names[i]);
+        dStr(10+i*140, hy+36, buf);
+    }
 }
 
 // ── Display ──────────────────────────────────────────────────
 static void display(){
-    glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT);
-    glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluOrtho2D(0,WIN_W,0,WIN_H);
-    glMatrixMode(GL_MODELVIEW);  glLoadIdentity();
+    glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
+    glMatrixMode(GL_PROJECTION);glLoadIdentity();gluOrtho2D(0,WIN_W,0,WIN_H);
+    glMatrixMode(GL_MODELVIEW);glLoadIdentity();
     glPushMatrix();
-    glTranslatef(0,WIN_H,0); glScalef(1,-1,1);
-    drawMaze();
-    drawPac();
+    glTranslatef(0,WIN_H,0);glScalef(1,-1,1);
+    drawMazeBg();
+    // Draw dummy target (yellow dot = simulated pac position)
+    glColor3f(1,1,0);fCirc(dummyX,dummyY,7);
+    for(auto& g:ghosts) drawGhost(g);
     drawHUD();
     glPopMatrix();
     glutSwapBuffers();
@@ -221,84 +332,84 @@ static void display(){
 static void update(int){
     glutTimerFunc(16,update,0);
     const float dt=0.016f;
-    float ps=pacSpd*(spdBoost?1.6f:1.0f);
 
-    // Try queued direction
-    if(pacWant!=pacDir){
-        int pd=(int)pacWant;
-        float nx=pacX+DC[pd]*ps, ny=pacY+DR[pd]*ps;
-        if(pacOK(nx,ny)) pacDir=pacWant;
-    }
-    // Move
-    {
-        int pd=(int)pacDir;
-        float nx=pacX+DC[pd]*ps, ny=pacY+DR[pd]*ps;
-        if(pacOK(nx,ny)){pacX=wrapX(nx);pacY=ny;}
-    }
-    mouthA+=mouthD*5;
-    if(mouthA>45) mouthD=-1;
-    if(mouthA<0){mouthA=0;mouthD=1;}
+    // Move dummy target in a slow circle around the maze
+    dummyAngle+=dt*0.4f;
+    dummyX=13.5f*CELL+cosf(dummyAngle)*5*CELL;
+    dummyY=14.5f*CELL+sinf(dummyAngle)*4*CELL;
 
-    // Eat dots
-    int cc=(int)(pacX/CELL), rr=(int)(pacY/CELL);
-    for(int dr=-1;dr<=1;dr++) for(int dc=-1;dc<=1;dc++){
-        int nc=cc+dc, nr=rr+dr;
-        if(nc<0||nc>=COLS||nr<0||nr>=ROWS) continue;
-        float cx=(nc+0.5f)*CELL, cy=(nr+0.5f)*CELL;
-        float d2=(pacX-cx)*(pacX-cx)+(pacY-cy)*(pacY-cy);
-        if(d2>(CELL*0.55f)*(CELL*0.55f)) continue;
-        if(maze[nr][nc]==0){maze[nr][nc]=2;score+=10;dotsLeft--;}
-        else if(maze[nr][nc]==3){maze[nr][nc]=2;score+=50;dotsLeft--;}
-    }
-
-    // Perks
-    for(auto& pk:perks){
-        if(!pk.on) continue;
-        float cx=(pk.c+0.5f)*CELL, cy=(pk.r+0.5f)*CELL;
-        float d2=(pacX-cx)*(pacX-cx)+(pacY-cy)*(pacY-cy);
-        if(d2<(CELL*0.7f)*(CELL*0.7f)){
-            pk.on=false; score+=100;
-            if(pk.type==0){spdBoost=true;spdT=5;}
-            else          {frozen=true;frzT=4;}
+    for(auto& g:ghosts){
+        if(g.inHouse){
+            g.houseWait-=dt;
+            g.progress+=dt*g.speed;
+            if(g.progress>=1.0f){
+                g.progress=0;g.col=g.tc;g.row=g.tr;
+                int nextC=g.col+(g.lastDir==D_R?1:-1);
+                if(nextC<11||nextC>16||maze[g.row][nextC]==1)g.lastDir=(g.lastDir==D_R?D_L:D_R);
+                nextC=g.col+(g.lastDir==D_R?1:-1);
+                if(nextC<11||nextC>16||maze[g.row][nextC]==1)nextC=g.col;
+                g.tc=nextC;g.tr=g.row;
+            }
+            if(g.houseWait<=0){
+                g.col=13;g.row=11;g.tc=12;g.tr=11;g.progress=0;g.lastDir=D_L;g.inHouse=false;
+            }
+            g.x=(g.col+0.5f)*CELL;g.y=(g.row+0.5f)*CELL;
+            continue;
+        }
+        updateFire(g,dt);
+        if(g.frightened){g.frighTimer-=dt;if(g.frighTimer<=0)g.frightened=false;}
+        float spd=g.speed*(g.frightened?0.5f:1.0f)*(g.eaten?2.5f:1.0f);
+        float saved=g.speed; g.speed=spd;
+        stepGhost(g,dt);
+        g.speed=saved;
+        // Eaten: return home
+        if(g.eaten){
+            float hx=13.5f*CELL,hy=14.5f*CELL;
+            float px=((1-g.progress)*g.col+g.progress*g.tc+0.5f)*CELL;
+            float py=((1-g.progress)*g.row+g.progress*g.tr+0.5f)*CELL;
+            if(fabsf(px-hx)<CELL&&fabsf(py-hy)<CELL&&!g.inHouse){
+                g.eaten=false;g.frightened=false;
+                g.col=13;g.row=14;g.tc=13;g.tr=14;g.progress=0;
+                g.inHouse=true;g.houseWait=2;g.lastDir=D_L;
+            }
         }
     }
-    if(spdBoost){spdT-=dt;if(spdT<=0)spdBoost=false;}
-    if(frozen)  {frzT-=dt;if(frzT<=0)frozen=false;}
-
-    if(dotsLeft<=0) initMaze(); // auto-reset when all dots eaten
-
     glutPostRedisplay();
 }
 
+// ── Init ─────────────────────────────────────────────────────
+static void init(){
+    for(int r=0;r<ROWS;r++) for(int c=0;c<COLS;c++) maze[r][c]=MT[r][c];
+    ghosts.clear();
+    for(int i=0;i<4;i++) ghosts.push_back(makeGhost(i));
+}
+
 // ── Input ────────────────────────────────────────────────────
-static void specKey(int k,int,int){
-    switch(k){
-        case GLUT_KEY_RIGHT: pacWant=D_R; break;
-        case GLUT_KEY_LEFT:  pacWant=D_L; break;
-        case GLUT_KEY_UP:    pacWant=D_U; break;
-        case GLUT_KEY_DOWN:  pacWant=D_D; break;
-    }
+static void mouse(int btn,int state,int,int){
+    if(btn==GLUT_LEFT_BUTTON&&state==GLUT_DOWN)
+        for(auto& g:ghosts)if(!g.inHouse&&!g.eaten){g.frightened=true;g.frighTimer=8;}
 }
 static void normKey(unsigned char k,int,int){
     if(k==27) exit(0);
-    if(k=='r'||k=='R') initMaze();
+    if(k=='r'||k=='R') init();
+    if(k==' ') for(auto& g:ghosts)if(!g.inHouse&&!g.eaten){g.eaten=true;g.frightened=false;}
 }
-static void reshape(int w,int h){ glViewport(0,0,w,h); }
+static void reshape(int w,int h){glViewport(0,0,w,h);}
 
 // ── Main ─────────────────────────────────────────────────────
 int main(int argc,char** argv){
+    srand((unsigned)time(nullptr));
     glutInit(&argc,argv);
     glutInitDisplayMode(GLUT_DOUBLE|GLUT_RGB);
     glutInitWindowSize(WIN_W,WIN_H);
-    glutCreateWindow("PAC-MAN | Member 1 - Maze & Movement");
-    glEnable(GL_LINE_SMOOTH);
-    glHint(GL_LINE_SMOOTH_HINT,GL_NICEST);
+    glutCreateWindow("PAC-MAN | Member 2 - Ghost AI Demo");
+    glEnable(GL_LINE_SMOOTH);glHint(GL_LINE_SMOOTH_HINT,GL_NICEST);
     glutDisplayFunc(display);
     glutReshapeFunc(reshape);
-    glutSpecialFunc(specKey);
     glutKeyboardFunc(normKey);
+    glutMouseFunc(mouse);
     glutTimerFunc(16,update,0);
-    initMaze();
+    init();
     glutMainLoop();
     return 0;
 }
